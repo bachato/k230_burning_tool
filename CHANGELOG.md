@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- Fixed macOS builds with SDKs that no longer include the legacy AGL framework.
 - Validate KDImage header and partition-table checksums, metadata, source
   hashes, and partition ranges before burning.
 - Harden loader communication against stale USB responses, synchronization

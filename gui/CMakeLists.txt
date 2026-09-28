@@ -46,6 +46,20 @@ find_package(
 	COMPONENTS Widgets LinguistTools Network Svg
 	REQUIRED)
 
+# Qt 6.6 may resolve AGL from /System even when that framework is only a broken
+# compatibility stub and is absent from the active macOS SDK.
+if(APPLE AND TARGET WrapOpenGL::WrapOpenGL)
+	get_target_property(K230_QT_OPENGL_LIBRARIES
+		WrapOpenGL::WrapOpenGL INTERFACE_LINK_LIBRARIES)
+	if(K230_QT_OPENGL_LIBRARIES)
+		list(FILTER K230_QT_OPENGL_LIBRARIES EXCLUDE REGEX
+			"(^|.*/)AGL\\.framework(/.*)?$")
+		list(REMOVE_ITEM K230_QT_OPENGL_LIBRARIES "-framework AGL")
+		set_property(TARGET WrapOpenGL::WrapOpenGL PROPERTY
+			INTERFACE_LINK_LIBRARIES "${K230_QT_OPENGL_LIBRARIES}")
+	endif()
+endif()
+
 # Print the Qt installation directory
 get_target_property(QtCore_location Qt6::Core IMPORTED_LOCATION)
 get_filename_component(Qt_INSTALL_DIR ${QtCore_location} DIRECTORY)
