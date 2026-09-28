@@ -24,6 +24,9 @@ BurnLibrary::~BurnLibrary() {
 
 	_pool->waitForDone(5000);
 	delete _pool;
+
+	kburnMonitorDestroy(ctx);
+	ctx = nullptr;
 }
 
 BurnLibrary::BurnLibrary(QWidget *parent) : parent(parent) {

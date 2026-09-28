@@ -28,12 +28,11 @@ class BurningProcess : public QObject, public QRunnable {
 	KBMonCTX scope;
 	bool isAutoCreate = false;
 
-	class QDataStream *imageStream = NULL;
-
 	void setResult(const KBurnException &reason);
 	void throwIfCancel();
 
 	void setStage(const QString &title, quint64 bytesToWrite = 0);
+	void setStageTitle(const QString &title);
 	void setProgress(quint64 writtenBytes);
 
 	virtual int prepare(QList<struct BurnImageItem>	&imageList, quint64 *total_size, quint64 *chunk_size, quint64 *blk_size) = 0;

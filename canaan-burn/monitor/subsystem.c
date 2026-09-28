@@ -28,6 +28,15 @@ void usb_subsystem_deinit(KBMonCTX monitor) {
 		return;
 	}
 
+	usb_monitor_pause(monitor);
+
+#ifndef WIN32
+	if (monitor->usb->libusb_thread) {
+		thread_destroy(monitor, monitor->usb->libusb_thread);
+		monitor->usb->libusb_thread = NULL;
+	}
+#endif
+
 	usb_monitor_destroy(monitor);
 
 	if (monitor->usb->libusb) {

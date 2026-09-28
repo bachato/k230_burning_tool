@@ -3,13 +3,15 @@
 #include "main.h"
 #include "MyException.h"
 
+#include <QByteArrayView>
 #include <QFileInfo>
 #include <QCryptographicHash>
 #include <algorithm>
 #include <limits>
 
 K230BurningProcess::K230BurningProcess(KBMonCTX scope, const K230BurningRequest *request)
-	: BurningProcess(scope, request), usbPath(request->usbPath), inputs(2) {
+	: BurningProcess(scope, request), usbPath(request->usbPath), inputs(2),
+	  verifyHash(QCryptographicHash::Sha256) {
 	this->setAutoDelete(false);
 };
 
@@ -62,6 +64,7 @@ int K230BurningProcess::prepare(QList<struct BurnImageItem> &imageList, quint64 
 	struct BurnImageItem loader;
 
 	kburnUsbIspCommandTaget isp_target = (kburnUsbIspCommandTaget)GlobalSetting::flashTarget.getValue();
+	verifyAfterWrite = GlobalSetting::verifyAfterWrite.getValue();
 
 	foreach(struct BurnImageItem item, imageList) {
 		if(item.partName == QString("loader")) {
@@ -79,8 +82,31 @@ int K230BurningProcess::prepare(QList<struct BurnImageItem> &imageList, quint64 
 	if (!loaderFile.open(QIODeviceBase::ReadOnly)) {
 		throw(KBurnException(::tr("Can't Open Image File") + " (" + loader.fileName + ")"));
 	}
-	QByteArray loaderFileContent = loaderFile.readAll();
+	if (!loader.fileSize || loader.dataSize > loader.fileSize ||
+	    loader.fileSize > static_cast<quint64>(std::numeric_limits<qsizetype>::max()) ||
+	    loader.fileOffset > static_cast<quint64>(loaderFile.size()) ||
+	    loader.dataSize > static_cast<quint64>(loaderFile.size()) - loader.fileOffset ||
+	    loader.fileOffset > static_cast<quint64>(std::numeric_limits<qint64>::max()) ||
+	    !loaderFile.seek(static_cast<qint64>(loader.fileOffset))) {
+		throw KBurnException(tr("Invalid loader source range"));
+	}
+	QByteArray loaderFileContent(
+		static_cast<qsizetype>(loader.fileSize),
+		static_cast<char>(loader.paddingValue));
+	if (loader.dataSize) {
+		const qint64 bytesRead = loaderFile.read(
+			loaderFileContent.data(), static_cast<qint64>(loader.dataSize));
+		if (bytesRead != static_cast<qint64>(loader.dataSize))
+			throw KBurnException(tr("Read loader failed"));
+	}
 	loaderFile.close();
+	if (!loader.dataSha256.isEmpty()) {
+		QCryptographicHash hash(QCryptographicHash::Sha256);
+		hash.addData(QByteArrayView(loaderFileContent.constData(),
+		                            static_cast<qsizetype>(loader.dataSize)));
+		if (hash.result() != loader.dataSha256)
+			throw KBurnException(tr("Loader SHA-256 mismatch"));
+	}
 
 	setStage(::tr("Waiting Stage1 Device"));
 
@@ -126,7 +152,10 @@ int K230BurningProcess::prepare(QList<struct BurnImageItem> &imageList, quint64 
 		throw KBurnException(tr("Device Memory error"));
 	}
 
-	kburn_nop(kburn);
+	if (!kburn_nop(kburn))
+		throw KBurnException(tr("Device synchronization failed"));
+	if (verifyAfterWrite && !kburn_supports_verify(kburn))
+		throw KBurnException(::tr("Loader does not support verification"));
 
 	if (false == kburn_probe(kburn, isp_target, (uint64_t*)chunk_size)) {
 		throw KBurnException(tr("Device Can't find Medium as Configured"));
@@ -202,6 +231,21 @@ bool K230BurningProcess::begin(struct BurnImageItem& item)
 			&_physical_file_size))
 		throw KBurnException(tr("Invalid image write layout: ") + item.partName);
 
+	currAltName = item.partName;
+	if (verifyAfterWrite) {
+		verifyOffset = _part_offset;
+		verifySize = _physical_file_size;
+		verifyPageSize = 0;
+		verifyOobSize = 0;
+		if (KBURN_FLAG_SPI_NAND_WRITE_WITH_OOB ==
+		    KBURN_FLAG_FLAG(_part_flag)) {
+			verifyPageSize = KBURN_FLAG_VAL1(_part_flag);
+			verifyOobSize = KBURN_FLAG_VAL2(_part_flag);
+		}
+		verifyHash.reset();
+		setStageTitle(::tr("Downloading..."));
+	}
+
     if (0x00 != (_part_offset % _medium_erase_size)) {
         throw KBurnException(tr("Image Start Offset %1 Should Align to %2 Bytes").arg(_part_offset).arg(_medium_erase_size));
     }
@@ -241,11 +285,58 @@ bool K230BurningProcess::begin(struct BurnImageItem& item)
 
 bool K230BurningProcess::step(quint64 address, const QByteArray &chunk, quint64 chunk_size)
 {
-	return kburn_write_chunk(kburn, (void *)chunk.constData(), chunk_size);
+	quint64 recordSize = 0;
+
+	if (verifyAfterWrite && verifyPageSize) {
+		recordSize = verifyPageSize + verifyOobSize;
+		if (recordSize < verifyPageSize || chunk_size % recordSize)
+			return false;
+	}
+
+	bool success = kburn_write_chunk(kburn, (void *)chunk.constData(), chunk_size);
+	if (!success || !verifyAfterWrite)
+		return success;
+
+	if (verifyPageSize) {
+		for (quint64 offset = 0; offset < chunk_size; offset += recordSize) {
+			verifyHash.addData(QByteArrayView(
+				chunk.constData() + static_cast<qsizetype>(offset),
+				static_cast<qsizetype>(verifyPageSize)));
+		}
+	} else {
+		verifyHash.addData(QByteArrayView(
+			chunk.constData(), static_cast<qsizetype>(chunk_size)));
+	}
+	return success;
 }
 
 bool K230BurningProcess::end(quint64 address) {
-	return kbrun_write_end(kburn);
+	uint64_t elapsedMs;
+
+	if (!kbrun_write_end(kburn))
+		return false;
+	if (!verifyAfterWrite)
+		return true;
+
+	QByteArray expectedDigest = verifyHash.result();
+	if (expectedDigest.size() != 32)
+		return false;
+
+	setStageTitle(::tr("Verifying..."));
+	if (!kburn_verify_sha256(
+		    kburn, verifyOffset, verifySize,
+		    reinterpret_cast<const uint8_t *>(expectedDigest.constData()),
+		    &elapsedMs))
+		return false;
+
+	double speedKiB = elapsedMs
+		? (verifySize / 1024.0) / (elapsedMs / 1000.0)
+		: 0.0;
+	BurnLibrary::instance()->localLog(
+		QStringLiteral("Verified partition %1: %2 bytes in %3 ms (%4 KiB/s)")
+			.arg(currAltName).arg(verifySize).arg(elapsedMs)
+			.arg(speedKiB, 0, 'f', 2));
+	return true;
 }
 
 void K230BurningProcess::ResetChip(void) {

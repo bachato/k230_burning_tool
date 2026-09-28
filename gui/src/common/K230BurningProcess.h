@@ -1,5 +1,6 @@
 #include "BurningProcess.h"
 #include "EventStack.h"
+#include <QCryptographicHash>
 #include <QString>
 
 #include <public/canaan-burn.h>
@@ -17,6 +18,12 @@ class K230BurningProcess : public BurningProcess {
 	size_t write_seq;
 	uint32_t chunk_size;
 	QString currAltName;
+	bool verifyAfterWrite = false;
+	quint64 verifyOffset = 0;
+	quint64 verifySize = 0;
+	quint64 verifyPageSize = 0;
+	quint64 verifyOobSize = 0;
+	QCryptographicHash verifyHash;
 
 	static void serial_isp_progress(void *, const kburnDeviceNode *, size_t, size_t);
 
