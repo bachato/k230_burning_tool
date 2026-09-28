@@ -1,6 +1,7 @@
 #include "BurningProcess.h"
 #include "EventStack.h"
 #include <QCryptographicHash>
+#include <QMutex>
 #include <QString>
 
 #include <public/canaan-burn.h>
@@ -12,6 +13,7 @@ class K230BurningProcess : public BurningProcess {
 	// kburnDeviceMemorySizeInfo devInfo;
 	kburnDeviceNode *node = NULL;
 	kburn_t *kburn = NULL;
+	QMutex kburnMutex;
 	QString usbPath;
 	QString _detailInfo;
 
@@ -41,5 +43,7 @@ class K230BurningProcess : public BurningProcess {
 	QString getTitle() const;
 
 	bool pollingDevice(kburnDeviceNode *node, BurnLibrary::DeviceEvent event);
+	void cancel(const KBurnException reason) override;
+	void cancel() override;
 	const QString &getDetailInfo() const { return _detailInfo; }
 };

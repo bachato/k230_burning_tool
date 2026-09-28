@@ -11,6 +11,7 @@
 #include <QPromise>
 #include <QThread>
 #include <QElapsedTimer>
+#include <QMutexLocker>
 
 #include "AppGlobalSetting.h"
 
@@ -45,12 +46,20 @@ BurningProcess::~BurningProcess() {
 }
 
 void BurningProcess::setResult(const KBurnException &reason) {
-	_result = reason;
+	QMutexLocker locker(&stateMutex);
+	if (!_isCanceled.load(std::memory_order_relaxed))
+		_result = reason;
+}
+
+KBurnException BurningProcess::getReason() const {
+	QMutexLocker locker(&stateMutex);
+	return _result;
 }
 
 void BurningProcess::schedule() {
-	if (!_isStarted && !_isCanceled) {
-		_isStarted = true;
+	bool expected = false;
+	if (!isCanceled() && _isStarted.compare_exchange_strong(
+			expected, true, std::memory_order_acq_rel)) {
 		BurnLibrary::instance()->getThreadPool()->start(this);
 	}
 }
@@ -68,7 +77,7 @@ void BurningProcess::_run() {
 
 	kburnUsbIspCommandTaget isp_target = (kburnUsbIspCommandTaget)GlobalSetting::flashTarget.getValue();
 
-	Q_ASSERT(_isStarted);
+	Q_ASSERT(isStarted());
 
 	QThread::currentThread()->setObjectName("burn:" + getTitle());
 
@@ -259,15 +268,15 @@ void BurningProcess::run() Q_DECL_NOTHROW {
 	} catch (KBurnException &e) {
 		BurnLibrary::instance()->localLog(QStringLiteral("Burn failed: %1").arg(e.errorMessage));
 		setResult(e); // may get result after return
-		emit failed(_result);
+		emit failed(getReason());
 		cleanup(false);
 	} catch (...) {
 		BurnLibrary::instance()->localLog(QStringLiteral("Burn failed: unexpected exception"));
 		setResult(KBurnException("Unknown Error"));
-		emit failed(_result);
+		emit failed(getReason());
 		cleanup(false);
 	}
-	_isCompleted = true;
+	_isCompleted.store(true, std::memory_order_release);
 	emit finished();
 }
 
@@ -289,13 +298,18 @@ void BurningProcess::setStageTitle(const QString &title) {
 }
 
 void BurningProcess::cancel(const KBurnException reason) {
-	if (!_isCanceled) {
-		_isCanceled = true;
-		if (_result.errorCode == KBurnNoErr) {
-			setResult(reason);
+	bool notify = false;
+	{
+		QMutexLocker locker(&stateMutex);
+		if (!_isCanceled.load(std::memory_order_relaxed)) {
+			if (_result.errorCode == KBurnNoErr)
+				_result = reason;
+			_isCanceled.store(true, std::memory_order_release);
+			notify = true;
 		}
-		emit cancelRequested();
 	}
+	if (notify)
+		emit cancelRequested();
 }
 
 void BurningProcess::cancel() {
@@ -303,10 +317,13 @@ void BurningProcess::cancel() {
 }
 
 void BurningProcess::throwIfCancel() {
-	if (_result.errorCode != KBurnNoErr) {
+	QMutexLocker locker(&stateMutex);
+	if (_isCanceled.load(std::memory_order_acquire)) {
+		throw _result.errorCode == KBurnNoErr
+			? KBurnException(KBurnCommonError::KBurnUserCancel,
+					 tr("User Canceled"))
+			: _result;
+	}
+	if (_result.errorCode != KBurnNoErr)
 		throw _result;
-	}
-	if (_isCanceled) {
-		throw KBurnException(tr("User Canceled"));
-	}
 }

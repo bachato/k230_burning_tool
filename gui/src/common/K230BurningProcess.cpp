@@ -6,6 +6,7 @@
 #include <QByteArrayView>
 #include <QFileInfo>
 #include <QCryptographicHash>
+#include <QMutexLocker>
 #include <algorithm>
 #include <limits>
 
@@ -148,9 +149,17 @@ int K230BurningProcess::prepare(QList<struct BurnImageItem> &imageList, quint64 
 
 	setStage(::tr("Init Device"));
 
-	if(NULL == (kburn = kburn_create(node))) {
+	kburn_t *created = kburn_create(node);
+	{
+		QMutexLocker locker(&kburnMutex);
+		kburn = created;
+		if (kburn && isCanceled())
+			kburn_cancel(kburn);
+	}
+	if(NULL == created) {
 		throw KBurnException(tr("Device Memory error"));
 	}
+	throwIfCancel();
 
 	if (!kburn_nop(kburn))
 		throw KBurnException(tr("Device synchronization failed"));
@@ -351,8 +360,15 @@ QString K230BurningProcess::errormsg()
 }
 
 void K230BurningProcess::cleanup(bool success) {
+	{
+		QMutexLocker locker(&kburnMutex);
+		kburn_destory(kburn);
+		kburn = nullptr;
+	}
+
 	if(node) {
 		mark_destroy_device_node(node);
+		node = nullptr;
 	}
 
 	if (!usb_ok) {
@@ -366,6 +382,19 @@ void K230BurningProcess::cleanup(bool success) {
 	// 	color = color << 16;
 	// }
 	// kburnUsbIspLedControl(node, GlobalSetting::usbLedPin.getValue(), kburnConvertColor(color));
+}
+
+void K230BurningProcess::cancel(const KBurnException reason) {
+	BurningProcess::cancel(reason);
+	inputs.cancel();
+
+	QMutexLocker locker(&kburnMutex);
+	kburn_cancel(kburn);
+}
+
+void K230BurningProcess::cancel() {
+	cancel(KBurnException(KBurnCommonError::KBurnUserCancel,
+			      ::tr("User Canceled")));
 }
 
 bool K230BurningProcess::pollingDevice(kburnDeviceNode *node, BurnLibrary::DeviceEvent event) {

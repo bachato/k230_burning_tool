@@ -6,11 +6,13 @@
 
 #include <inttypes.h>
 #include <limits.h>
+#include <stdatomic.h>
 
 #define RETRY_MAX                   (5)
 #define USB_TIMEOUT                 (2000)
 #define CMD_FLAG_DEV_TO_HOST        (0x8000)
 #define KBURN_MAX_STALE_RESPONSES   (8)
+#define KBURN_CANCEL_POLL_MS        (100)
 #define KBURN_FLAG_SPI_NAND_WRITE_WITH_OOB (1024)
 #define KBURN_FLAG_FLAG(flag) (((flag) >> 48) & 0xffff)
 #define KBURN_FLAG_VAL1(flag) (((flag) >> 16) & 0xffffffff)
@@ -80,6 +82,7 @@ _Static_assert(sizeof(struct kburn_medium_info) == 32,
 
 struct kburn_t {
     kburnDeviceNode *node;
+	atomic_bool cancel_requested;
 
     struct kburn_medium_info medium_info;
 
@@ -93,6 +96,19 @@ struct kburn_t {
 	uint64_t out_chunk_size;
     uint64_t dl_total, dl_size, dl_offset;
 };
+
+static bool kburn_is_cancel_requested(const kburn_t *kburn)
+{
+	return kburn && atomic_load_explicit(&kburn->cancel_requested,
+					      memory_order_acquire);
+}
+
+static int kburn_cancelled(kburn_t *kburn)
+{
+	strncpy(kburn->error_msg, "operation canceled", sizeof(kburn->error_msg));
+	kburn->error_msg[sizeof(kburn->error_msg) - 1] = '\0';
+	return KBrunUsbCommError;
+}
 
 static bool kburn_copy_error_message(const struct kburn_usb_pkt_wrap *packet,
                                      kburn_t *kburn)
@@ -197,6 +213,8 @@ static int kburn_write_data(kburn_t *kburn, void *data, int length)
 
 	if (!kburn || length < 0 || (length && !data))
 		return KBrunUsbCommError;
+	if (kburn_is_cancel_requested(kburn))
+		return kburn_cancelled(kburn);
 
     kburnDeviceNode *node = kburn->node;
 
@@ -216,6 +234,8 @@ static int kburn_write_data(kburn_t *kburn, void *data, int length)
             libusb_strerror((enum libusb_error)rc), length, size);
         return KBrunUsbCommError;
     }
+	if (kburn_is_cancel_requested(kburn))
+		return kburn_cancelled(kburn);
 
     return KBurnNoErr;
 }
@@ -223,6 +243,8 @@ static int kburn_write_data(kburn_t *kburn, void *data, int length)
 static int kburn_write_zlp(kburn_t *kburn)
 {
 	int rc, size = 0;
+	if (kburn_is_cancel_requested(kburn))
+		return kburn_cancelled(kburn);
 	kburnDeviceNode *node = kburn->node;
 
 	rc = libusb_bulk_transfer(node->usb->handle, kburn->ep_out, NULL, 0,
@@ -238,29 +260,51 @@ static int kburn_write_zlp(kburn_t *kburn)
 
 static int kburn_read_data(kburn_t *kburn, void *data, int length, int *is_timeout)
 {
-    int rc = -1, size = 0;
+	int rc = -1, size = 0;
+	uint64_t remaining;
+	const uint64_t timeout = kburn ? kburn->medium_info.timeout_ms : 0;
 
 	if (!kburn || length < 0 || (length && !data))
 		return KBrunUsbCommError;
 
-    kburnDeviceNode *node = kburn->node;
+	kburnDeviceNode *node = kburn->node;
+	remaining = timeout;
 
-    rc = libusb_bulk_transfer(/* dev_handle       */ node->usb->handle,
-                             /* endpoint         */ kburn->ep_in,
-                             /* bulk data        */ data,
-                             /* bulk data length */ length,
-                             /* transferred      */ &size,
-                             /* timeout          */ kburn->medium_info.timeout_ms);
+	for (;;) {
+		unsigned int poll_timeout = KBURN_CANCEL_POLL_MS;
 
-    if(is_timeout && (LIBUSB_ERROR_TIMEOUT == rc)) {
-        *is_timeout = rc;
-    }
+		if (kburn_is_cancel_requested(kburn))
+			return kburn_cancelled(kburn);
+		if (timeout && remaining < poll_timeout)
+			poll_timeout = (unsigned int)remaining;
+
+		size = 0;
+		rc = libusb_bulk_transfer(/* dev_handle       */ node->usb->handle,
+					  /* endpoint         */ kburn->ep_in,
+					  /* bulk data        */ data,
+					  /* bulk data length */ length,
+					  /* transferred      */ &size,
+					  /* timeout          */ poll_timeout);
+
+		if (rc != LIBUSB_ERROR_TIMEOUT || size != 0)
+			break;
+		if (!timeout)
+			continue;
+		if (remaining <= poll_timeout) {
+			if (is_timeout)
+				*is_timeout = rc;
+			break;
+		}
+		remaining -= poll_timeout;
+	}
 
     if ((rc != LIBUSB_SUCCESS) || (size != length)) {
         debug_print(KBURN_LOG_ERROR, "Error - can't recv bulk data, error %s, length %d, transfered %d", \
             libusb_strerror((enum libusb_error)rc), length, size);
         return KBrunUsbCommError;
     }
+	if (kburn_is_cancel_requested(kburn))
+		return kburn_cancelled(kburn);
 
     // if(length <= 64) {
     //     print_buffer(KBURN_LOG_ERROR, "usb recv", data, length);
@@ -379,14 +423,16 @@ static int kburn_send_cmd(kburn_t *kburn, enum kburn_pkt_cmd cmd, void *data, in
 
     if(KBurnNoErr != kburn_write_data(kburn, &cbw, sizeof(cbw))) {
         debug_print(KBURN_LOG_ERROR, "command send data failed");
-        strncpy(kburn->error_msg, "cmd send failed", sizeof(kburn->error_msg));
+		if (!kburn_is_cancel_requested(kburn))
+			strncpy(kburn->error_msg, "cmd send failed", sizeof(kburn->error_msg));
 
         return KBrunUsbCommError;
     }
 
     if(KBurnNoErr != kburn_read_response(kburn, cmd, &csw, NULL)) {
         debug_print(KBURN_LOG_ERROR, "command recv data failed");
-        strncpy(kburn->error_msg, "cmd recv failed", sizeof(kburn->error_msg));
+		if (!kburn_is_cancel_requested(kburn))
+			strncpy(kburn->error_msg, "cmd recv failed", sizeof(kburn->error_msg));
         return KBrunUsbCommError;
     }
 
@@ -484,6 +530,7 @@ kburn_t *kburn_create(kburnDeviceNode *node)
 
     if(kburn) {
         memset(kburn, 0, sizeof(*kburn));
+		atomic_init(&kburn->cancel_requested, false);
         kburn->node = node;
         kburn->medium_info.timeout_ms = 1000;
 
@@ -505,6 +552,13 @@ void kburn_destory(kburn_t *kburn)
     if(kburn) {
         free(kburn);
     }
+}
+
+void kburn_cancel(kburn_t *kburn)
+{
+	if (kburn)
+		atomic_store_explicit(&kburn->cancel_requested, true,
+				      memory_order_release);
 }
 
 char *kburn_get_error_msg(kburn_t *kburn)

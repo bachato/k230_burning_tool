@@ -16,6 +16,7 @@ typedef struct kburn_t kburn_t;
 
 PUBLIC kburn_t *kburn_create(kburnDeviceNode *node);
 PUBLIC void kburn_destory(kburn_t *kburn);
+PUBLIC void kburn_cancel(kburn_t *kburn);
 
 PUBLIC void kburn_reset_chip(kburn_t *kburn);
 PUBLIC bool kburn_nop(struct kburn_t *kburn);

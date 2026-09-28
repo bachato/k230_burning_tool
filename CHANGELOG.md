@@ -22,6 +22,8 @@
   failures, invalid transfer ranges, and probe timeouts.
 - Fixed USB monitor shutdown and hotplug lifecycle races, and continue device
   enumeration when an individual USB device is rejected.
+- Cancel active burn jobs and long USB waits during GUI shutdown so the
+  application exits promptly.
 
 ## 2.2.5 - 2026-09-10
 
